@@ -70,10 +70,8 @@ class EventQueueListener(stomp.ConnectionListener):
                     instance_filenames = [x.name for x in fp_instances]
                     with ThreadPool(config.THREADS) as pool:
                         results = pool.map(lambda idata: run_solver(fp_solver.name, idata[0], idata[1], payload['arguments']), zip(payload['instance_ids'], instance_filenames))
-                        # upload result
-                        r = requests.post(config.SMTLAB_API_ENDPOINT + "/runs/{}/results".format(payload['run_id']), json=results)
-                        r.raise_for_status()
-                        
+                        result_action = {'action': 'process_results', 'run_id': payload['run_id'], 'results': results}
+                        self.conn.send(body=json.dumps(result_action), destination="queue/scheduler")
         else:
             logging.error(f"received message with unknown 'action' {payload['action']}")
 
