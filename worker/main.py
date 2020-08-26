@@ -16,7 +16,7 @@ import config
 # {'instance_id': instance_id, 'result': string, "sat"/"unsat"/"timeout"/"unknown"/"error", 'stdout': string, runtime: integer, runtime *in milliseconds*}
 def run_solver(solver_binary_path, instance_id, instance_path, arguments, timeout=20):
     result_obj = {'instance_id': instance_id}
-    time = timer.Timer ()
+    time = Timer ()
     try:
         out = subprocess.check_output ([solver_binary_path]+arguments+[smtfile],timeout=timeout).decode().strip()
     except subprocess.TimeoutExpired:
@@ -124,3 +124,13 @@ class Worker():
         except KeyboardInterrupt:
             logging.info("Caught signal, shutting down")
             self.conn.disconnect()
+
+class Timer:
+    def __init__(self):
+        self._l1 = time.perf_counter()
+
+    def stop (self):
+        self._l2 = time.perf_counter ()
+
+    def getTime (self):
+        return self._l2-self._l1
