@@ -24,12 +24,14 @@ def run_solver(solver_binary_path, instance_id, instance_path, arguments, timeou
         result_obj['result'] = "timeout"
         result_obj['stdout'] = ""
         result_obj['runtime'] = timeout
+        return result_obj
     except subprocess.CalledProcessError as e:
         time.stop()
         result_obj['result'] = "error"
         result_obj['stdout'] = "Errormessage: " + str(e) + "Solveroutput: " + out
         result_obj['runtime'] = time.getTime()
-
+        return result_obj
+        
     time.stop()    
 
     result_obj['stdout'] = out
