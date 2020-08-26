@@ -7,6 +7,8 @@ import tempfile
 import base64
 import os
 import contextlib
+import subprocess
+import time
 
 import config
 
@@ -14,10 +16,36 @@ import config
 # {'instance_id': instance_id, 'result': string, "sat"/"unsat"/"timeout"/"unknown"/"error", 'stdout': string, runtime: integer, runtime *in milliseconds*}
 def run_solver(solver_binary_path, instance_id, instance_path, arguments, timeout=20):
     result_obj = {'instance_id': instance_id}
-    # TODO
-    result_obj['result'] = "error"
-    result_obj['stdout'] = "worker process not implemented yet!"
-    result_obj['runtime'] = 0
+    time = timer.Timer ()
+    try:
+        out = subprocess.check_output ([solver_binary_path]+arguments+[smtfile],timeout=timeout).decode().strip()
+    except subprocess.TimeoutExpired:
+        time.stop()
+        result_obj['result'] = "timeout"
+        result_obj['stdout'] = ""
+        result_obj['runtime'] = timeout
+    except subprocess.CalledProcessError as e:
+        time.stop()
+        result_obj['result'] = "error"
+        result_obj['stdout'] = "Errormessage: " + str(e) + "Solveroutput: " + out
+        result_obj['runtime'] = time.getTime()
+
+    time.stop()    
+
+    result_obj['stdout'] = out
+    result_obj['runtime'] = timeout
+
+    if "unsat" in out:
+        result_obj['result'] = "unsat"
+    elif "sat" in out:
+        result_obj['result'] = "sat"
+    elif time.getTime() >= timeout:
+        # sometimes python's subprocess does not terminate eagerly  
+        result_obj['result'] = "timeout"
+        result_obj['runtime'] = timeout
+    elif "unknown" in out:
+        result_obj['result'] = "unknown"
+
     return result_obj
 
 class EventQueueListener(stomp.ConnectionListener):
@@ -57,7 +85,7 @@ class EventQueueListener(stomp.ConnectionListener):
                 fp_solver.write(base64.b64decode(r.json['base64_binary']))
                 fp_solver.flush()
                 # make the solver binary executable
-                os.chmod(fp_solver.name, 0700)
+                os.chmod(fp_solver.name, 700)
                 # download all instances
                 with contextlib.ExitStack() as stack:
                     fp_instances = [stack.enter_context(tempfile.NamedTemporaryFile(suffix=".smt2")) for i in payload['instance_ids']]
