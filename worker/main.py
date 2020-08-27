@@ -15,27 +15,31 @@ import config
 # This method should return a dictionary of the following form:
 # {'instance_id': instance_id, 'result': string, "sat"/"unsat"/"timeout"/"unknown"/"error", 'stdout': string, runtime: integer, runtime *in milliseconds*}
 def run_solver(solver_binary_path, instance_id, instance_path, arguments, timeout=20):
+    logging.info(f"Running {solver_binary_path} on instance {instance_path}: {arguments}, timeout={timeout}")
     result_obj = {'instance_id': instance_id}
     time = Timer ()
+
+    timeout_ms = int(timeout * 1000.0)
+    
     try:
         out = subprocess.check_output ([solver_binary_path]+arguments+[smtfile],timeout=timeout).decode().strip()
     except subprocess.TimeoutExpired:
         time.stop()
         result_obj['result'] = "timeout"
         result_obj['stdout'] = ""
-        result_obj['runtime'] = timeout
+        result_obj['runtime'] = timeout_ms
         return result_obj
     except subprocess.CalledProcessError as e:
         time.stop()
         result_obj['result'] = "error"
-        result_obj['stdout'] = "Errormessage: " + str(e) + "Solveroutput: " + out
-        result_obj['runtime'] = time.getTime()
+        result_obj['stdout'] = "error-message: " + str(e) + "\nsolver-output: " + out
+        result_obj['runtime'] = time.getTime_ms()
         return result_obj
         
     time.stop()    
 
     result_obj['stdout'] = out
-    result_obj['runtime'] = timeout
+    result_obj['runtime'] = time.getTime_ms()
 
     if "unsat" in out:
         result_obj['result'] = "unsat"
@@ -44,10 +48,11 @@ def run_solver(solver_binary_path, instance_id, instance_path, arguments, timeou
     elif time.getTime() >= timeout:
         # sometimes python's subprocess does not terminate eagerly  
         result_obj['result'] = "timeout"
-        result_obj['runtime'] = timeout
+        result_obj['runtime'] = timeout_ms
     elif "unknown" in out:
         result_obj['result'] = "unknown"
 
+    logging.info(f"result is {result_obj}")
     return result_obj
 
 class EventQueueListener(stomp.ConnectionListener):
@@ -136,3 +141,6 @@ class Timer:
 
     def getTime (self):
         return self._l2-self._l1
+
+    def getTime_ms(self):
+        return int(self.getTime() * 1000.0)
