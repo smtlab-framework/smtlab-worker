@@ -1,10 +1,12 @@
 import os
 import logging
 
-LOG_LEVEL = logging.DEBUG
+LOG_LEVEL = logging.INFO
 SMTLAB_API_ENDPOINT = os.environ.get('SMTLAB_API_ENDPOINT') or 'http://127.0.0.1:5000'
-QUEUE_CONNECTION = [(os.environ.get('QUEUE_HOST') or '127.0.0.1', os.environ.get('QUEUE_PORT') or 61613)]
-QUEUE_USERNAME = os.environ.get('QUEUE_USER') or 'smtlab'
-QUEUE_PASSWORD = os.environ.get('QUEUE_PASS') or 'smtlab'
+QUEUE_URL = os.environ.get('SMTLAB_QUEUE_URL') or 'http://127.0.0.1:9324'
 QUEUES = ['regression', 'performance']
-THREADS = os.environ.get('SMTLAB_WORKER_THREADS') or 1
+try:
+    THREADS = int(os.environ.get('SMTLAB_WORKER_THREADS')) or 1
+except ValueError:
+    logging.warn("SMTLAB_WORKER_THREADS environment variable must be an integer")
+    THREADS = 1

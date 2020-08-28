@@ -1,5 +1,5 @@
 import logging
-import stomp
+import boto3
 import json
 import requests
 from multiprocessing.pool import ThreadPool
@@ -22,18 +22,21 @@ def run_solver(solver_binary_path, instance_id, instance_path, arguments, timeou
     timeout_ms = int(timeout * 1000.0)
     
     try:
-        out = subprocess.check_output ([solver_binary_path]+arguments+[smtfile],timeout=timeout).decode().strip()
+        argument_array = json.loads(arguments)
+        out = subprocess.check_output ([solver_binary_path] + argument_array + [instance_path],timeout=timeout).decode('UTF-8').strip()
     except subprocess.TimeoutExpired:
         time.stop()
         result_obj['result'] = "timeout"
         result_obj['stdout'] = ""
         result_obj['runtime'] = timeout_ms
+        logging.info(f"timeout, result is {result_obj}")
         return result_obj
     except subprocess.CalledProcessError as e:
         time.stop()
         result_obj['result'] = "error"
-        result_obj['stdout'] = "error-message: " + str(e) + "\nsolver-output: " + out
+        result_obj['stdout'] = f"stdout: {e.stdout} stderr: {e.stderr}"
         result_obj['runtime'] = time.getTime_ms()
+        logging.info(f"process exited with an error, result is {result_obj}")
         return result_obj
         
     time.stop()    
@@ -51,30 +54,41 @@ def run_solver(solver_binary_path, instance_id, instance_path, arguments, timeou
         result_obj['runtime'] = timeout_ms
     elif "unknown" in out:
         result_obj['result'] = "unknown"
+    else:
+        result_obj['result'] = "error"
+        
 
     logging.info(f"result is {result_obj}")
-    return result_obj
+    return result_obj    
 
-class EventQueueListener(stomp.ConnectionListener):
-    def __init__(self, conn):
-        self.conn = conn
+class Worker():
+    def __init__(self):
+        logging.basicConfig(level=config.LOG_LEVEL)
+        self.client = boto3.resource('sqs', endpoint_url=config.QUEUE_URL, region_name='elasticmq', aws_access_key_id='x', aws_secret_access_key='x', use_ssl=False)
 
-    def on_error(self, frame):
-        logging.error(f"message queue error: {frame.body}")
-
-    def on_message(self, frame):
+    def run(self):
+        logging.info("Starting SMTLab worker")
+        queues = []
+        for queue in config.QUEUES:
+            queues.append(self.client.get_queue_by_name(QueueName=queue))
+            logging.info(f"Will check {queue} queue")
         try:
-            payload = json.loads(frame.body)
+            while True:
+                for queue in queues:
+                    for message in queue.receive_messages(MaxNumberOfMessages=1, WaitTimeSeconds=1, VisibilityTimeout=60):
+                        self.handle_message(message)
+                        message.delete()
+        except KeyboardInterrupt:
+            logging.info("Caught signal, shutting down")
+
+    def handle_message(self, message):
+        logging.info(f"Received message {message.body}")
+        try:
+            payload = json.loads(message.body)
         except ValueError:
-            logging.error(f"received malformed message: {frame.body}")
-            self.conn.ack(frame.headers['message-id'], frame.headers['subscription'])
-        try:
-            self.handle_message(payload)
-        except:
-            logging.exception("Exception thrown in handle_message()")
-        self.conn.ack(frame.headers['message-id'], frame.headers['subscription'])
-
-    def handle_message(self, payload):
+            logging.error(f"received malformed message: {body}")
+            return
+        
         if "action" not in payload:
             logging.error("received message with no 'action'")
             return
@@ -86,51 +100,38 @@ class EventQueueListener(stomp.ConnectionListener):
             logging.info(f"Running {len(payload['instance_ids'])} instances with solver {payload['solver_id']}")
             # download the solver binary to a temporary directory
             # TODO cache this across multiple messages
-            with tempfile.NamedTemporaryFile() as fp_solver:
+            fp_solver = tempfile.NamedTemporaryFile(mode="w+b", delete=False)
+            try:
+                logging.info(f"Downloading solver binary.")
                 r = requests.get(config.SMTLAB_API_ENDPOINT + "/solvers/{}".format(payload['solver_id']))
                 r.raise_for_status()
-                fp_solver.write(base64.b64decode(r.json['base64_binary']))
+                fp_solver.write(base64.b64decode(r.json()['base64_binary']))
                 fp_solver.flush()
+                fp_solver.close()
                 # make the solver binary executable
-                os.chmod(fp_solver.name, 700)
+                os.chmod(fp_solver.name, 0o700)
+                # extend timeout on redelivering this message to twice the maximum timeout of all runs
+                message.change_visibility(VisibilityTimeout=60 + 2 * 20 * len(payload['instance_ids']))
                 # download all instances
                 with contextlib.ExitStack() as stack:
-                    fp_instances = [stack.enter_context(tempfile.NamedTemporaryFile(suffix=".smt2")) for i in payload['instance_ids']]
+                    fp_instances = [stack.enter_context(tempfile.NamedTemporaryFile(mode="w+", suffix=".smt2")) for i in payload['instance_ids']]
                     # TODO this could likely be parallelized
                     for (instance_id, fp_instance) in zip(payload['instance_ids'], fp_instances):
+                        logging.info(f"Downloading instance {instance_id}.")
                         r = requests.get(config.SMTLAB_API_ENDPOINT + "/instances/{}".format(instance_id))
                         r.raise_for_status()
-                        fp_instance.write(r.json['body'])
+                        fp_instance.write(r.json()['body'])
                         fp_instance.flush()
                     instance_filenames = [x.name for x in fp_instances]
                     with ThreadPool(config.THREADS) as pool:
                         results = pool.map(lambda idata: run_solver(fp_solver.name, idata[0], idata[1], payload['arguments']), zip(payload['instance_ids'], instance_filenames))
                         result_action = {'action': 'process_results', 'run_id': payload['run_id'], 'results': results}
-                        self.conn.send(body=json.dumps(result_action), destination="queue/scheduler")
+                        queue = self.client.get_queue_by_name(QueueName="scheduler")
+                        queue.send_message(MessageBody=json.dumps(result_action))
+            finally:
+                os.remove(fp_solver.name)
         else:
             logging.error(f"received message with unknown 'action' {payload['action']}")
-
-class Worker():
-    def __init__(self):
-        logging.basicConfig(level=config.LOG_LEVEL)
-        self.conn = stomp.Connection(config.QUEUE_CONNECTION)
-        self.conn.set_listener('', EventQueueListener(self.conn))
-
-    def run(self):
-        logging.info("Starting SMTLab worker")
-        self.conn.connect(config.QUEUE_USERNAME, config.QUEUE_PASSWORD, wait=True)
-        logging.info("Connected to queue endpoint")
-        subscription_id = 1
-        for queue in config.QUEUES:
-            self.conn.subscribe(destination=f"queue/{queue}", id=subscription_id, ack='client-individual')
-            logging.info(f"Subscribed to {queue} queue")
-            subscription_id += 1
-        try:
-            while True:
-                pass
-        except KeyboardInterrupt:
-            logging.info("Caught signal, shutting down")
-            self.conn.disconnect()
 
 class Timer:
     def __init__(self):
