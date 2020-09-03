@@ -9,6 +9,7 @@ import os
 import contextlib
 import subprocess
 import time
+import re
 
 import config
 
@@ -61,10 +62,77 @@ def run_solver(solver_binary_path, instance_id, instance_path, arguments, timeou
     logging.info(f"result is {result_obj}")
     return result_obj    
 
-def validate_result(solver_binary_path, solver_arguments, instance_path, model):
+#
+# Auxiliaries for the validation
+def _translate_smt26_escape_to_smt25(self,text):
+    return re.sub('u{(..)}', r'x\1', re.sub('u{(.)}', r'x0\1', text))  
+
+def _get_stripped_smt_commands(filepath,removables=["(define-fun","(declare-fun","(declare-const","(get-model"]):
+    s=open(filepath,"r")
+    # remove all comments
+    tmp_instance = ""
+    for l in s:
+        if not l.startswith(";"):
+            tmp_instance+=l
+
+    # identify matching positions
+    toret = dict()
+    pstack = []
+    for i, c in enumerate(tmp_instance):
+        if c == '(':
+            pstack.append(i)
+        elif c == ')':
+            if len(pstack) == 0:
+                raise IndexError("No matching closing parens at: " + str(i))
+            toret[pstack.pop()] = i
+    if len(pstack) > 0:
+        raise IndexError("No matching opening parens at: " + str(pstack.pop()))
+
+    # extract matching blocks
+    instance_list = []
+    logic = "(set-logic ALL)"
+    for (i,j) in toret.items():
+        covered = False
+        for (x,y) in [(n,m) for (n,m) in toret.items() if (n,m) != (i,j)]:
+            this_range = list(range(x,y+1))
+            if i in this_range and j in this_range:
+                covered = True
+                break
+        if not covered:
+            smt_cmd = tmp_instance[i:j+1]
+            if smt_cmd.startswith("(set-logic"):
+                logic=smt_cmd
+            elif functools.reduce(lambda a,b : a and b, [not smt_cmd.startswith(x) for x in removables]):
+                instance_list+=[tmp_instance[i:j+1]]
+    return [logic]+instance_list
+
+def validate_result(solver_binary_path, solver_arguments, instance_path, model, old_smt25_escape_translation=True):
     result_obj['validation'] = "error"
     result_obj['stdout'] = ""
-    # TODO
+
+    # translate \u{XX} escape sequences to the old ones (\xXX)
+    if old_smt25_escape_translation:
+        model=self._translate_smt26_escape_to_smt25(model)
+
+    # create new smt instance
+    new_smt_cmds = self._get_stripped_smt_commands_and_logic(instance_path)
+    tmpdir = tempfile.mkdtemp ()
+    validation_file = os.path.join (tmpdir,"out.smt")
+    f=open(validation_file,"w")
+    for l in [new_smt_cmds[0]]+[model]+new_smt_cmds[1:]:
+        f.write(l+"\n")
+    f.close()
+
+    # perform validation; run solver needs an instance ID, is this needed here too?
+    veri_result_obj = self.run_solver(solver_binary_path, 0, validation_file, solver_arguments)
+    if veri_result_obj['result'] == "sat":
+        result_obj['validation'] = "true"
+        logging.info(f"successfully verified.")
+    else:
+        logging.info(f"found an invalid model.")
+
+    # clean up
+    shutil.rmtree (tmpdir)
     return result_obj
 
 class Worker():
@@ -161,7 +229,15 @@ class Worker():
                 r_result = requests.get(config.SMTLAB_API_ENDPOINT + "/results/{}".format(payload['result_id']))
                 r_result.raise_for_status()
                 result_info = r_result.json()
-                result_stdout = result_info['stdout']
+
+                # we are only able to verfiy sat instances with a model 
+                # TODO: move this to another place later
+                if result_info['result'] != "sat":
+                    logging.info(f"received 'validate' message for result {payload['result_id']} which is not reported as satisfiable.")
+                    return
+
+                smt_model = "".join(model.split("\n")[1:-1])[len("(model"):] # strip output "sat" and the surrounding (model ...); works for CVC4 and Z3 models
+
                 # ...and download the correct instance
                 # TODO cache these as well
                 with tempfile.NamedTemporaryFile(mode="w+", suffix=".smt2") as fp_instance:
@@ -170,7 +246,7 @@ class Worker():
                     fp_instance.write(r.json()['body'])
                     fp_instance.flush()
                     # TODO threading
-                    result = validate_result(fp_solver.name, solver_arguments, fp_instance.name, result_stdout)
+                    result = validate_result(fp_solver.name, solver_arguments, fp_instance.name, smt_model)
                     result_action = {'action': 'process_validation', 'result_id': payload['result_id'], 'solver_id': payload['solver_id'], 'validation': result['validation'], 'stdout': result['stdout']}
                     queue = self.client.get_queue_by_name(QueueName="scheduler")
                     queue.send_message(MessageBody=json.dumps(result_action))
