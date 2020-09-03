@@ -10,7 +10,6 @@ import contextlib
 import subprocess
 import time
 import re
-import shutil
 
 import config
 
@@ -117,24 +116,27 @@ def validate_result(self,solver_binary_path, solver_arguments, instance_path, mo
 
     # create new smt instance
     new_smt_cmds = self._get_stripped_smt_commands_and_logic(instance_path)
-    tmpdir = tempfile.mkdtemp ()
-    validation_file = os.path.join (tmpdir,"out.smt")
-    f=open(validation_file,"w")
-    for l in [new_smt_cmds[0]]+[model]+new_smt_cmds[1:]:
-        f.write(l+"\n")
-    f.close()
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        validation_file = os.path.join (tmpdirname, "out.smt2")
+        f=open(validation_file,"w")
+        for l in [new_smt_cmds[0]]+[model]+new_smt_cmds[1:]:
+            f.write(l+"\n")
+        f.close()
 
-    # perform validation; run solver needs an instance ID, is this needed here too?
-    veri_result_obj = self.run_solver(solver_binary_path, 0, validation_file, solver_arguments)
-    if veri_result_obj['result'] == "sat":
-        result_obj['validation'] = "true"
-        logging.info(f"successfully verified.")
-    else:
-        logging.info(f"found an invalid model.")
+        # perform validation - pass a "fake" instance ID since we don't need it
+        veri_result_obj = self.run_solver(solver_binary_path, 0, validation_file, solver_arguments)
+        result_obj['stdout'] = veri_result_obj['stdout']
+        if veri_result_obj['result'] == "sat":
+            result_obj['validation'] = "valid"
+            logging.info(f"successfully verified.")
+        elif veri_result_obj['result'] == "unsat":
+            result_obj['validation'] = "invalid"
+            logging.info(f"found an invalid model.")
+        else:
+            result_obj['validation'] = veri_result_obj['result']
+            logging.info(f"validation inconclusive.")
 
-    # clean up
-    shutil.rmtree (tmpdir)
-    return result_obj
+        return result_obj
 
 class Worker():
     def __init__(self):
