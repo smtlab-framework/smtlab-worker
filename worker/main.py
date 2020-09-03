@@ -68,7 +68,7 @@ def run_solver(solver_binary_path, instance_id, instance_path, arguments, timeou
 def _translate_smt26_escape_to_smt25(self,text):
     return re.sub('u{(..)}', r'x\1', re.sub('u{(.)}', r'x0\1', text))  
 
-def _get_stripped_smt_commands(filepath,removables=["(define-fun","(declare-fun","(declare-const","(get-model"]):
+def _get_stripped_smt_commands(self,filepath,removables=["(define-fun","(declare-fun","(declare-const","(get-model"]):
     s=open(filepath,"r")
     # remove all comments
     tmp_instance = ""
