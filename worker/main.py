@@ -107,7 +107,7 @@ def _get_stripped_smt_commands(self,filepath,removables=["(define-fun","(declare
                 instance_list+=[tmp_instance[i:j+1]]
     return [logic]+instance_list
 
-def validate_result(solver_binary_path, solver_arguments, instance_path, model, old_smt25_escape_translation=True):
+def validate_result(self,solver_binary_path, solver_arguments, instance_path, model, old_smt25_escape_translation=True):
     result_obj['validation'] = "error"
     result_obj['stdout'] = ""
 
