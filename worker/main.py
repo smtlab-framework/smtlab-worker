@@ -10,6 +10,7 @@ import contextlib
 import subprocess
 import time
 import re
+import shutil
 
 import config
 
