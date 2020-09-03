@@ -10,6 +10,7 @@ import contextlib
 import subprocess
 import time
 import re
+import functools
 
 import config
 
@@ -64,10 +65,10 @@ def run_solver(solver_binary_path, instance_id, instance_path, arguments, timeou
 
 #
 # Auxiliaries for the validation
-def _translate_smt26_escape_to_smt25(self,text):
+def _translate_smt26_escape_to_smt25(text):
     return re.sub('u{(..)}', r'x\1', re.sub('u{(.)}', r'x0\1', text))  
 
-def _get_stripped_smt_commands(self,filepath,removables=["(define-fun","(declare-fun","(declare-const","(get-model"]):
+def _get_stripped_smt_commands(filepath,removables=["(define-fun","(declare-fun","(declare-const","(get-model"]):
     s=open(filepath,"r")
     # remove all comments
     tmp_instance = ""
@@ -106,16 +107,17 @@ def _get_stripped_smt_commands(self,filepath,removables=["(define-fun","(declare
                 instance_list+=[tmp_instance[i:j+1]]
     return [logic]+instance_list
 
-def validate_result(self,solver_binary_path, solver_arguments, instance_path, model, old_smt25_escape_translation=True):
+def validate_result(solver_binary_path, solver_arguments, instance_path, model, old_smt25_escape_translation=True):
+    result_obj = {}
     result_obj['validation'] = "error"
     result_obj['stdout'] = ""
 
     # translate \u{XX} escape sequences to the old ones (\xXX)
     if old_smt25_escape_translation:
-        model=self._translate_smt26_escape_to_smt25(model)
+        model=_translate_smt26_escape_to_smt25(model)
 
     # create new smt instance
-    new_smt_cmds = self._get_stripped_smt_commands_and_logic(instance_path)
+    new_smt_cmds = _get_stripped_smt_commands(instance_path)
     with tempfile.TemporaryDirectory() as tmpdirname:
         validation_file = os.path.join (tmpdirname, "out.smt2")
         f=open(validation_file,"w")
@@ -124,7 +126,7 @@ def validate_result(self,solver_binary_path, solver_arguments, instance_path, mo
         f.close()
 
         # perform validation - pass a "fake" instance ID since we don't need it
-        veri_result_obj = self.run_solver(solver_binary_path, 0, validation_file, solver_arguments)
+        veri_result_obj = run_solver(solver_binary_path, 0, validation_file, solver_arguments)
         result_obj['stdout'] = veri_result_obj['stdout']
         if veri_result_obj['result'] == "sat":
             result_obj['validation'] = "valid"
@@ -227,7 +229,7 @@ class Worker():
                 # make binary executable
                 os.chmod(fp_solver.name, 0o700)
                 # extend message timeout by a few seconds
-                message_change_visibility(VisibilityTimeout = 120)
+                message.change_visibility(VisibilityTimeout = 120)
                 # fetch the result data...
                 r_result = requests.get(config.SMTLAB_API_ENDPOINT + "/results/{}".format(payload['result_id']))
                 r_result.raise_for_status()
@@ -239,7 +241,7 @@ class Worker():
                     logging.info(f"received 'validate' message for result {payload['result_id']} which is not reported as satisfiable.")
                     return
 
-                smt_model = "".join(model.split("\n")[1:-1])[len("(model"):] # strip output "sat" and the surrounding (model ...); works for CVC4 and Z3 models
+                smt_model = "".join(result_info['stdout'].split("\n")[1:-1])[len("(model"):] # strip output "sat" and the surrounding (model ...); works for CVC4 and Z3 models
 
                 # ...and download the correct instance
                 # TODO cache these as well
