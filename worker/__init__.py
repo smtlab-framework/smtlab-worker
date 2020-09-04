@@ -1,3 +1,5 @@
 from . import main
 
-worker = main.Worker()
+def run_worker():
+    worker = main.Worker()
+    worker.run()

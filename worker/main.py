@@ -2,7 +2,6 @@ import logging
 import boto3
 import json
 import requests
-from multiprocessing.pool import ThreadPool
 import tempfile
 import base64
 import os
@@ -151,14 +150,11 @@ class Worker():
         for queue in config.QUEUES:
             queues.append(self.client.get_queue_by_name(QueueName=queue))
             logging.info(f"Will check {queue} queue")
-        try:
-            while True:
-                for queue in queues:
-                    for message in queue.receive_messages(MaxNumberOfMessages=1, WaitTimeSeconds=1, VisibilityTimeout=60):
-                        self.handle_message(message)
-                        message.delete()
-        except KeyboardInterrupt:
-            logging.info("Caught signal, shutting down")
+        while True:
+            for queue in queues:
+                for message in queue.receive_messages(MaxNumberOfMessages=1, WaitTimeSeconds=1, VisibilityTimeout=60):
+                    self.handle_message(message)
+                    message.delete()
 
     def handle_message(self, message):
         logging.info(f"Received message {message.body}")
@@ -173,10 +169,11 @@ class Worker():
             return
         if payload['action'] == "run":
             # run instances
-            if "run_id" not in payload or "solver_id" not in payload or "instance_ids" not in payload or "arguments" not in payload:
+            if "run_id" not in payload or "solver_id" not in payload or "instance_id" not in payload or "arguments" not in payload:
                 logging.error("received 'run' message with missing required fields")
                 return
-            logging.info(f"Running {len(payload['instance_ids'])} instances with solver {payload['solver_id']}")
+            instance_id = payload['instance_id']
+            logging.info(f"Running instance {instance_id} with solver {payload['solver_id']}")
             # download the solver binary to a temporary directory
             # TODO cache this across multiple messages
             fp_solver = tempfile.NamedTemporaryFile(mode="w+b", delete=False)
@@ -188,25 +185,20 @@ class Worker():
                 fp_solver.flush()
                 fp_solver.close()
                 # make the solver binary executable
-                os.chmod(fp_solver.name, 0o700)
-                # extend timeout on redelivering this message to twice the maximum timeout of all runs
-                message.change_visibility(VisibilityTimeout=60 + 2 * 20 * len(payload['instance_ids']))
+                os.chmod(fp_solver.name, 0o500)
+                # extend timeout on redelivering this message
+                message.change_visibility(VisibilityTimeout=60 + 2 * 20)
                 # download all instances
-                with contextlib.ExitStack() as stack:
-                    fp_instances = [stack.enter_context(tempfile.NamedTemporaryFile(mode="w+", suffix=".smt2")) for i in payload['instance_ids']]
-                    # TODO this could likely be parallelized
-                    for (instance_id, fp_instance) in zip(payload['instance_ids'], fp_instances):
-                        logging.info(f"Downloading instance {instance_id}.")
-                        r = requests.get(config.SMTLAB_API_ENDPOINT + "/instances/{}".format(instance_id))
-                        r.raise_for_status()
-                        fp_instance.write(r.json()['body'])
-                        fp_instance.flush()
-                    instance_filenames = [x.name for x in fp_instances]
-                    with ThreadPool(config.THREADS) as pool:
-                        results = pool.map(lambda idata: run_solver(fp_solver.name, idata[0], idata[1], payload['arguments']), zip(payload['instance_ids'], instance_filenames))
-                        result_action = {'action': 'process_results', 'run_id': payload['run_id'], 'results': results}
-                        queue = self.client.get_queue_by_name(QueueName="scheduler")
-                        queue.send_message(MessageBody=json.dumps(result_action))
+                with tempfile.NamedTemporaryFile(mode="w+", suffix=".smt2") as fp_instance:
+                    logging.info(f"Downloading instance {instance_id}.")
+                    r = requests.get(config.SMTLAB_API_ENDPOINT + "/instances/{}".format(instance_id))
+                    r.raise_for_status()
+                    fp_instance.write(r.json()['body'])
+                    fp_instance.flush()
+                    result = run_solver(fp_solver.name, instance_id, fp_instance.name, payload['arguments'])
+                    result_action = {'action': 'process_results', 'run_id': payload['run_id'], 'results': [results]}
+                    queue = self.client.get_queue_by_name(QueueName="scheduler")
+                    queue.send_message(MessageBody=json.dumps(result_action))
             finally:
                 os.remove(fp_solver.name)
         elif payload['action'] == "validate":
