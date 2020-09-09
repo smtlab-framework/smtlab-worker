@@ -1,5 +1,5 @@
 from . import main
 
-def run_worker():
-    worker = main.Worker()
+def run_worker(solvers):
+    worker = main.Worker(solvers)
     worker.run()

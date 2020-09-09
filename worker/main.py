@@ -10,6 +10,7 @@ import subprocess
 import time
 import re
 import functools
+import filelock
 
 import config
 
@@ -106,7 +107,7 @@ def _get_stripped_smt_commands(filepath,removables=["(define-fun","(declare-fun"
                 instance_list+=[tmp_instance[i:j+1]]
     return [logic]+instance_list
 
-def validate_result(solver_binary_path, solver_arguments, instance_path, model, old_smt25_escape_translation=True):
+def validate_result(solver_binary_path, solver_arguments, instance_path, model, old_smt25_escape_translation=False):
     result_obj = {}
     result_obj['validation'] = "error"
     result_obj['stdout'] = ""
@@ -139,13 +140,47 @@ def validate_result(solver_binary_path, solver_arguments, instance_path, model, 
 
         return result_obj
 
+def get_solver_path_or_download(solver_id):
+    key = f"smtlab-solver-{solver_id}.bin"
+    keypath = config.SMTLAB_SOLVER_DIR + "/" + key
+    lockpath = keypath + ".lock"
+    if os.path.exists(keypath):
+        return keypath
+    else:
+        # download the solver to SMTLAB_SOLVER_DIR, mark it as executable, and rename it to 'keypath'
+        lock = filelock.FileLock(lockpath)
+        with lock:
+            # test again - the file may have just been created if there was contention on this lock
+            if os.path.exists(keypath):
+                return keypath
+            else:
+                solver_path = ""
+                logging.info(f"Downloading solver {solver_id}.")
+                with tempfile.NamedTemporaryFile(mode="w+b", dir=config.SMTLAB_SOLVER_DIR, delete=False) as fp_solver:
+                    r = requests.get(config.SMTLAB_API_ENDPOINT + "/solvers/{}".format(solver_id))
+                    r.raise_for_status()
+                    fp_solver.write(base64.b64decode(r.json()['base64_binary']))
+                    fp_solver.flush()
+                    fp_solver.close()
+                    solver_path = fp_solver.name
+                os.rename(solver_path, keypath)
+                os.chmod(keypath, 0o500)
+                return keypath
+                
+    
 class Worker():
-    def __init__(self):
+    def __init__(self, solvers):
         logging.basicConfig(level=config.LOG_LEVEL)
         self.client = boto3.resource('sqs', endpoint_url=config.QUEUE_URL, region_name='elasticmq', aws_access_key_id='x', aws_secret_access_key='x', use_ssl=False)
+        self.solvers = solvers
 
     def run(self):
         logging.info("Starting SMTLab worker")
+        if not os.path.exists(config.SMTLAB_SOLVER_DIR):
+            try:
+                os.makedirs(config.SMTLAB_SOLVER_DIR)
+            except FileExistsError:
+                pass
         queues = []
         for queue in config.QUEUES:
             queues.append(self.client.get_queue_by_name(QueueName=queue))
@@ -176,80 +211,68 @@ class Worker():
             logging.info(f"Running instance {instance_id} with solver {payload['solver_id']}")
             # download the solver binary to a temporary directory
             # TODO cache this across multiple messages
-            fp_solver = tempfile.NamedTemporaryFile(mode="w+b", delete=False)
-            try:
-                logging.info(f"Downloading solver binary.")
-                r = requests.get(config.SMTLAB_API_ENDPOINT + "/solvers/{}".format(payload['solver_id']))
+            fp_solver = get_solver_path_or_download(payload['solver_id'])
+            # extend timeout on redelivering this message
+            message.change_visibility(VisibilityTimeout=60 + 2 * 20)
+            # download all instances
+            with tempfile.NamedTemporaryFile(mode="w+", suffix=".smt2") as fp_instance:
+                logging.info(f"Downloading instance {instance_id}.")
+                r = requests.get(config.SMTLAB_API_ENDPOINT + "/instances/{}".format(instance_id))
                 r.raise_for_status()
-                fp_solver.write(base64.b64decode(r.json()['base64_binary']))
-                fp_solver.flush()
-                fp_solver.close()
-                # make the solver binary executable
-                os.chmod(fp_solver.name, 0o500)
-                # extend timeout on redelivering this message
-                message.change_visibility(VisibilityTimeout=60 + 2 * 20)
-                # download all instances
-                with tempfile.NamedTemporaryFile(mode="w+", suffix=".smt2") as fp_instance:
-                    logging.info(f"Downloading instance {instance_id}.")
-                    r = requests.get(config.SMTLAB_API_ENDPOINT + "/instances/{}".format(instance_id))
-                    r.raise_for_status()
-                    fp_instance.write(r.json()['body'])
-                    fp_instance.flush()
-                    result = run_solver(fp_solver.name, instance_id, fp_instance.name, payload['arguments'])
-                    result_action = {'action': 'process_results', 'run_id': payload['run_id'], 'results': [results]}
-                    queue = self.client.get_queue_by_name(QueueName="scheduler")
-                    queue.send_message(MessageBody=json.dumps(result_action))
-            finally:
-                os.remove(fp_solver.name)
+                fp_instance.write(r.json()['body'])
+                fp_instance.flush()
+                result = run_solver(fp_solver, instance_id, fp_instance.name, payload['arguments'])
+                result_action = {'action': 'process_results', 'run_id': payload['run_id'], 'results': [result]}
+                queue = self.client.get_queue_by_name(QueueName="scheduler")
+                queue.send_message(MessageBody=json.dumps(result_action))
         elif payload['action'] == "validate":
             # validate a result
             if "result_id" not in payload or "solver_id" not in payload:
                 logging.error("received 'validate' message with missing required fields")
                 return
             logging.info(f"Validating result {payload['result_id']} with solver {payload['solver_id']}")
-            # download the solver binary to a temporary directory
-            # TODO cache this across multiple messages
-            fp_solver = tempfile.NamedTemporaryFile(mode="w+b", delete=False)
-            try:
-                logging.info("Downloading solver binary.")
-                r = requests.get(config.SMTLAB_API_ENDPOINT + "/solvers/{}".format(payload['solver_id']))
+            fp_solver = get_solver_path_or_download(payload['solver_id'])
+            solver_arguments = None
+            for solver in self.solvers:
+                if solver['id'] == payload['solver_id']:
+                    solver_arguments = solver['default_arguments']
+                    break
+            if solver_arguments is None:
+                # update cached solver data
+                r = requests.get(config.SMTLAB_API_ENDPOINT + "/solvers")
                 r.raise_for_status()
-                solver_arguments = r.json()['default_arguments']
-                fp_solver.write(base64.b64decode(r.json()['base64_binary']))
-                fp_solver.flush()
-                fp_solver.close()
-                # make binary executable
-                os.chmod(fp_solver.name, 0o700)
-                # extend message timeout by a few seconds
-                message.change_visibility(VisibilityTimeout = 120)
-                # fetch the result data...
-                r_result = requests.get(config.SMTLAB_API_ENDPOINT + "/results/{}".format(payload['result_id']))
-                r_result.raise_for_status()
-                result_info = r_result.json()
+                self.solvers = r.json()
+                solver_arguments = "[]"
+                for solver in self.solvers:
+                    if solver['id'] == payload['solver_id']:
+                        solver_arguments = solver['default_arguments']
+                        break
+            # extend message timeout by a few seconds
+            message.change_visibility(VisibilityTimeout = 120)
+            # fetch the result data...
+            r_result = requests.get(config.SMTLAB_API_ENDPOINT + "/results/{}".format(payload['result_id']))
+            r_result.raise_for_status()
+            result_info = r_result.json()
 
-                # we are only able to verfiy sat instances with a model 
-                # TODO: move this to another place later
-                if result_info['result'] != "sat":
-                    logging.info(f"received 'validate' message for result {payload['result_id']} which is not reported as satisfiable.")
-                    return
+            # we are only able to verfiy sat instances with a model 
+            # TODO: move this to another place later
+            if result_info['result'] != "sat":
+                logging.info(f"received 'validate' message for result {payload['result_id']} which is not reported as satisfiable.")
+                return
 
-                smt_model = "".join(result_info['stdout'].split("\n")[1:-1])[len("(model"):] # strip output "sat" and the surrounding (model ...); works for CVC4 and Z3 models
+            smt_model = "".join(result_info['stdout'].split("\n")[1:-1])[len("(model"):] # strip output "sat" and the surrounding (model ...); works for CVC4 and Z3 models
 
-                # ...and download the correct instance
-                # TODO cache these as well
-                with tempfile.NamedTemporaryFile(mode="w+", suffix=".smt2") as fp_instance:
-                    r = requests.get(config.SMTLAB_API_ENDPOINT + "/instances/{}".format(result_info['instance_id']))
-                    r.raise_for_status()
-                    fp_instance.write(r.json()['body'])
-                    fp_instance.flush()
-                    # TODO threading
-                    result = validate_result(fp_solver.name, solver_arguments, fp_instance.name, smt_model)
-                    result_action = {'action': 'process_validation', 'result_id': payload['result_id'], 'solver_id': payload['solver_id'], 'validation': result['validation'], 'stdout': result['stdout']}
-                    queue = self.client.get_queue_by_name(QueueName="scheduler")
-                    queue.send_message(MessageBody=json.dumps(result_action))
-            finally:
-                os.remove(fp_solver.name)
-            # TODO
+            # ...and download the correct instance
+            # TODO cache these as well
+            with tempfile.NamedTemporaryFile(mode="w+", suffix=".smt2") as fp_instance:
+                r = requests.get(config.SMTLAB_API_ENDPOINT + "/instances/{}".format(result_info['instance_id']))
+                r.raise_for_status()
+                fp_instance.write(r.json()['body'])
+                fp_instance.flush()
+                result = validate_result(fp_solver, solver_arguments, fp_instance.name, smt_model)
+                result_action = {'action': 'process_validation', 'result_id': payload['result_id'], 'solver_id': payload['solver_id'], 'validation': result['validation'], 'stdout': result['stdout']}
+                queue = self.client.get_queue_by_name(QueueName="scheduler")
+                queue.send_message(MessageBody=json.dumps(result_action))
         else:
             logging.error(f"received message with unknown 'action' {payload['action']}")
 

@@ -10,3 +10,4 @@ try:
 except ValueError:
     logging.warn("SMTLAB_WORKER_THREADS environment variable must be an integer")
     THREADS = 1
+SMTLAB_SOLVER_DIR = os.environ.get('SMTLAB_SOLVER_DIR') or os.getcwd() + "/solvers"
