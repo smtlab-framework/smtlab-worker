@@ -6,7 +6,7 @@ import multiprocessing
 import requests
 
 if __name__ == '__main__':
-    r = requests.get(config.SMTLAB_API_ENDPOINT + "/solvers")
+    r = requests.get(config.SMTLAB_API_ENDPOINT + "/solvers", auth=(config.SMTLAB_USERNAME, config.SMTLAB_PASSWORD))
     r.raise_for_status()
     solvers = r.json()
     

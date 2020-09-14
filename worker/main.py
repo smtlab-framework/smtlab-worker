@@ -157,7 +157,7 @@ def get_solver_path_or_download(solver_id):
                 solver_path = ""
                 logging.info(f"Downloading solver {solver_id}.")
                 with tempfile.NamedTemporaryFile(mode="w+b", dir=config.SMTLAB_SOLVER_DIR, delete=False) as fp_solver:
-                    r = requests.get(config.SMTLAB_API_ENDPOINT + "/solvers/{}".format(solver_id))
+                    r = requests.get(config.SMTLAB_API_ENDPOINT + "/solvers/{}".format(solver_id), auth=(config.SMTLAB_USERNAME, config.SMTLAB_PASSWORD))
                     r.raise_for_status()
                     fp_solver.write(base64.b64decode(r.json()['base64_binary']))
                     fp_solver.flush()
@@ -217,7 +217,7 @@ class Worker():
             # download all instances
             with tempfile.NamedTemporaryFile(mode="w+", suffix=".smt2") as fp_instance:
                 logging.info(f"Downloading instance {instance_id}.")
-                r = requests.get(config.SMTLAB_API_ENDPOINT + "/instances/{}".format(instance_id))
+                r = requests.get(config.SMTLAB_API_ENDPOINT + "/instances/{}".format(instance_id), auth=(config.SMTLAB_USERNAME, config.SMTLAB_PASSWORD))
                 r.raise_for_status()
                 fp_instance.write(r.json()['body'])
                 fp_instance.flush()
@@ -239,7 +239,7 @@ class Worker():
                     break
             if solver_arguments is None:
                 # update cached solver data
-                r = requests.get(config.SMTLAB_API_ENDPOINT + "/solvers")
+                r = requests.get(config.SMTLAB_API_ENDPOINT + "/solvers", auth=(config.SMTLAB_USERNAME, config.SMTLAB_PASSWORD))
                 r.raise_for_status()
                 self.solvers = r.json()
                 solver_arguments = "[]"
@@ -250,7 +250,7 @@ class Worker():
             # extend message timeout by a few seconds
             message.change_visibility(VisibilityTimeout = 120)
             # fetch the result data...
-            r_result = requests.get(config.SMTLAB_API_ENDPOINT + "/results/{}".format(payload['result_id']))
+            r_result = requests.get(config.SMTLAB_API_ENDPOINT + "/results/{}".format(payload['result_id']), auth=(config.SMTLAB_USERNAME, config.SMTLAB_PASSWORD))
             r_result.raise_for_status()
             result_info = r_result.json()
 
@@ -265,7 +265,7 @@ class Worker():
             # ...and download the correct instance
             # TODO cache these as well
             with tempfile.NamedTemporaryFile(mode="w+", suffix=".smt2") as fp_instance:
-                r = requests.get(config.SMTLAB_API_ENDPOINT + "/instances/{}".format(result_info['instance_id']))
+                r = requests.get(config.SMTLAB_API_ENDPOINT + "/instances/{}".format(result_info['instance_id']), auth=(config.SMTLAB_USERNAME, config.SMTLAB_PASSWORD))
                 r.raise_for_status()
                 fp_instance.write(r.json()['body'])
                 fp_instance.flush()
