@@ -1,5 +1,4 @@
 import logging
-import boto3
 import json
 import requests
 import tempfile
@@ -171,7 +170,6 @@ def get_solver_path_or_download(solver_id):
 class Worker():
     def __init__(self, solvers):
         logging.basicConfig(level=config.LOG_LEVEL)
-        self.client = boto3.resource('sqs', endpoint_url=config.QUEUE_URL, region_name='elasticmq', aws_access_key_id='x', aws_secret_access_key='x', use_ssl=False)
         self.solvers = solvers
 
     def run(self):
@@ -181,23 +179,28 @@ class Worker():
                 os.makedirs(config.SMTLAB_SOLVER_DIR)
             except FileExistsError:
                 pass
-        queues = []
         for queue in config.QUEUES:
-            queues.append(self.client.get_queue_by_name(QueueName=queue))
             logging.info(f"Will check {queue} queue")
+        backoff = 0
         while True:
-            for queue in queues:
-                for message in queue.receive_messages(MaxNumberOfMessages=1, WaitTimeSeconds=1, VisibilityTimeout=60):
-                    self.handle_message(message)
-                    message.delete()
+            got_message = False
+            for queue in config.QUEUES:
+                r = requests.get(config.SMTLAB_API_ENDPOINT + "/queues/{}".format(queue), auth=(config.SMTLAB_USERNAME, config.SMTLAB_PASSWORD))
+                r.raise_for_status()
+                messages = r.json()
+                if messages:
+                    got_message = True
+                    for message in messages:
+                        self.handle_message(message)
+            if got_message:
+                backoff = 0
+            else:
+                time.sleep(0.1 * 2.0 ** backoff)
+                if backoff < config.QUEUE_BACKOFF_LIMIT:
+                    backoff += 1
 
-    def handle_message(self, message):
-        logging.info(f"Received message {message.body}")
-        try:
-            payload = json.loads(message.body)
-        except ValueError:
-            logging.error(f"received malformed message: {body}")
-            return
+    def handle_message(self, payload):
+        logging.info(f"Received message {payload}")
         
         if "action" not in payload:
             logging.error("received message with no 'action'")
@@ -212,8 +215,6 @@ class Worker():
             # download the solver binary to a temporary directory
             # TODO cache this across multiple messages
             fp_solver = get_solver_path_or_download(payload['solver_id'])
-            # extend timeout on redelivering this message
-            message.change_visibility(VisibilityTimeout=60 + 2 * 20)
             # download all instances
             with tempfile.NamedTemporaryFile(mode="w+", suffix=".smt2") as fp_instance:
                 logging.info(f"Downloading instance {instance_id}.")
@@ -223,8 +224,8 @@ class Worker():
                 fp_instance.flush()
                 result = run_solver(fp_solver, instance_id, fp_instance.name, payload['arguments'])
                 result_action = {'action': 'process_results', 'run_id': payload['run_id'], 'results': [result]}
-                queue = self.client.get_queue_by_name(QueueName="scheduler")
-                queue.send_message(MessageBody=json.dumps(result_action))
+                r = requests.post(config.SMTLAB_API_ENDPOINT + "/queues/scheduler", json=result_action, auth=(config.SMTLAB_USERNAME, config.SMTLAB_PASSWORD))
+                r.raise_for_status()
         elif payload['action'] == "validate":
             # validate a result
             if "result_id" not in payload or "solver_id" not in payload:
@@ -247,8 +248,6 @@ class Worker():
                     if solver['id'] == payload['solver_id']:
                         solver_arguments = solver['default_arguments']
                         break
-            # extend message timeout by a few seconds
-            message.change_visibility(VisibilityTimeout = 120)
             # fetch the result data...
             r_result = requests.get(config.SMTLAB_API_ENDPOINT + "/results/{}".format(payload['result_id']), auth=(config.SMTLAB_USERNAME, config.SMTLAB_PASSWORD))
             r_result.raise_for_status()
@@ -271,8 +270,8 @@ class Worker():
                 fp_instance.flush()
                 result = validate_result(fp_solver, solver_arguments, fp_instance.name, smt_model)
                 result_action = {'action': 'process_validation', 'result_id': payload['result_id'], 'solver_id': payload['solver_id'], 'validation': result['validation'], 'stdout': result['stdout']}
-                queue = self.client.get_queue_by_name(QueueName="scheduler")
-                queue.send_message(MessageBody=json.dumps(result_action))
+                r = requests.post(config.SMTLAB_API_ENDPOINT + "/queues/scheduler", json=result_action, auth=(config.SMTLAB_USERNAME, config.SMTLAB_PASSWORD))
+                r.raise_for_status()
         else:
             logging.error(f"received message with unknown 'action' {payload['action']}")
 
