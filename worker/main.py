@@ -191,7 +191,11 @@ class Worker():
                 if messages:
                     got_message = True
                     for message in messages:
-                        self.handle_message(message)
+                        try:
+                            payload = json.loads(message)
+                            self.handle_message(payload)
+                        except json.JSONDecodeError:
+                            logging.error(f"Received invalid message {message}")
             if got_message:
                 backoff = 0
             else:
