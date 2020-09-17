@@ -188,7 +188,7 @@ class Worker():
                 r = requests.get(config.SMTLAB_API_ENDPOINT + "/queues/{}".format(queue), auth=(config.SMTLAB_USERNAME, config.SMTLAB_PASSWORD))
                 r.raise_for_status()
                 messages = r.json()
-                if messages:
+                if len(messages) > 0:
                     got_message = True
                     for message in messages:
                         try:
@@ -201,6 +201,7 @@ class Worker():
             else:
                 time.sleep(0.1 * 2.0 ** backoff)
                 if backoff < config.QUEUE_BACKOFF_LIMIT:
+                    print(f"No messages, backing off (n={backoff})")
                     backoff += 1
 
     def handle_message(self, payload):

@@ -17,8 +17,8 @@ if __name__ == '__main__':
         processes.append(proc)
         proc.start()
     try:
-        while True:
-            pass
+        for proc in processes:
+            proc.join()
     except KeyboardInterrupt:
         for proc in processes:
             proc.kill()
