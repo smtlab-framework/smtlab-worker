@@ -2,7 +2,7 @@ import os
 import logging
 
 LOG_LEVEL = logging.INFO
-SMTLAB_API_ENDPOINT = os.environ.get('SMTLAB_API_ENDPOINT') or 'http://127.0.0.1:5000'
+SMTLAB_API_ENDPOINT = os.environ.get('SMTLAB_API_ENDPOINT') or 'http://127.0.0.1:5000/'
 QUEUES = ['performance', 'regression']
 QUEUE_BACKOFF_LIMIT = 8
 try:

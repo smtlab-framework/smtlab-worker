@@ -10,8 +10,26 @@ import time
 import re
 import functools
 import filelock
+from requests_toolbelt import sessions
+from requests.exceptions import RetryError
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
 
 import config
+
+class TimeoutHTTPAdapter(HTTPAdapter):
+    def __init__(self, *args, **kwargs):
+        self.timeout = 5 # seconds
+        if "timeout" in kwargs:
+            self.timeout = kwargs['timeout']
+            del kwargs['timeout']
+        super().__init__(*args, **kwargs)
+
+    def send(self, request, **kwargs):
+        timeout = kwargs.get('timeout')
+        if timeout is None:
+            kwargs['timeout'] = self.timeout
+        return super().send(request, **kwargs)
 
 # This method should return a dictionary of the following form:
 # {'instance_id': instance_id, 'result': string, "sat"/"unsat"/"timeout"/"unknown"/"error", 'stdout': string, runtime: integer, runtime *in milliseconds*}
@@ -139,39 +157,46 @@ def validate_result(solver_binary_path, solver_arguments, instance_path, model, 
 
         return result_obj
 
-def get_solver_path_or_download(solver_id):
-    key = f"smtlab-solver-{solver_id}.bin"
-    keypath = config.SMTLAB_SOLVER_DIR + "/" + key
-    lockpath = keypath + ".lock"
-    if os.path.exists(keypath):
-        return keypath
-    else:
-        # download the solver to SMTLAB_SOLVER_DIR, mark it as executable, and rename it to 'keypath'
-        lock = filelock.FileLock(lockpath)
-        with lock:
-            # test again - the file may have just been created if there was contention on this lock
-            if os.path.exists(keypath):
-                return keypath
-            else:
-                solver_path = ""
-                logging.info(f"Downloading solver {solver_id}.")
-                with tempfile.NamedTemporaryFile(mode="w+b", dir=config.SMTLAB_SOLVER_DIR, delete=False) as fp_solver:
-                    r = requests.get(config.SMTLAB_API_ENDPOINT + "/solvers/{}".format(solver_id), auth=(config.SMTLAB_USERNAME, config.SMTLAB_PASSWORD))
-                    r.raise_for_status()
-                    fp_solver.write(base64.b64decode(r.json()['base64_binary']))
-                    fp_solver.flush()
-                    fp_solver.close()
-                    solver_path = fp_solver.name
-                os.rename(solver_path, keypath)
-                os.chmod(keypath, 0o500)
-                return keypath
-                
-    
+   
 class Worker():
     def __init__(self, solvers):
         logging.basicConfig(level=config.LOG_LEVEL)
         self.solvers = solvers
-
+        self.http = sessions.BaseUrlSession(base_url=config.SMTLAB_API_ENDPOINT)
+        retry_strategy = Retry(total=5, method_whitelist=["HEAD", "GET", "PUT", "POST", "OPTIONS"], status_forcelist=[429, 500, 502, 503, 504], backoff_factor=1)
+        adapter = TimeoutHTTPAdapter(max_retries = retry_strategy)
+        self.http.mount("http://", adapter)
+        self.http.mount("https://", adapter)
+        self.http.auth = (config.SMTLAB_USERNAME, config.SMTLAB_PASSWORD)
+        assert_status_hook = lambda response, *args, **kwargs: response.raise_for_status()
+        self.http.hooks['response'] = [assert_status_hook]
+        
+    def get_solver_path_or_download(solver_id):
+        key = f"smtlab-solver-{solver_id}.bin"
+        keypath = config.SMTLAB_SOLVER_DIR + "/" + key
+        lockpath = keypath + ".lock"
+        if os.path.exists(keypath):
+            return keypath
+        else:
+            # download the solver to SMTLAB_SOLVER_DIR, mark it as executable, and rename it to 'keypath'
+            lock = filelock.FileLock(lockpath)
+            with lock:
+                # test again - the file may have just been created if there was contention on this lock
+                if os.path.exists(keypath):
+                    return keypath
+                else:
+                    solver_path = ""
+                    logging.info(f"Downloading solver {solver_id}.")
+                    with tempfile.NamedTemporaryFile(mode="w+b", dir=config.SMTLAB_SOLVER_DIR, delete=False) as fp_solver:
+                        r = self.http.get(f"solvers/{solver_id}")
+                        fp_solver.write(base64.b64decode(r.json()['base64_binary']))
+                        fp_solver.flush()
+                        fp_solver.close()
+                        solver_path = fp_solver.name
+                    os.rename(solver_path, keypath)
+                    os.chmod(keypath, 0o500)
+                    return keypath                
+        
     def run(self):
         logging.info("Starting SMTLab worker")
         if not os.path.exists(config.SMTLAB_SOLVER_DIR):
@@ -183,26 +208,28 @@ class Worker():
             logging.info(f"Will check {queue} queue")
         backoff = 0
         while True:
-            got_message = False
-            for queue in config.QUEUES:
-                r = requests.get(config.SMTLAB_API_ENDPOINT + "/queues/{}".format(queue), auth=(config.SMTLAB_USERNAME, config.SMTLAB_PASSWORD))
-                r.raise_for_status()
-                messages = r.json()
-                if len(messages) > 0:
-                    got_message = True
-                    for message in messages:
-                        try:
-                            payload = json.loads(message)
-                            self.handle_message(payload)
-                        except json.JSONDecodeError:
-                            logging.error(f"Received invalid message {message}")
-            if got_message:
-                backoff = 0
-            else:
-                time.sleep(0.1 * 2.0 ** backoff)
-                if backoff < config.QUEUE_BACKOFF_LIMIT:
-                    print(f"No messages, backing off (n={backoff})")
-                    backoff += 1
+            try:
+                got_message = False
+                for queue in config.QUEUES:
+                    r = self.http.get(f"queues/{queue}")
+                    messages = r.json()
+                    if len(messages) > 0:
+                        got_message = True
+                        for message in messages:
+                            try:
+                                payload = json.loads(message)
+                                self.handle_message(payload)
+                            except json.JSONDecodeError:
+                                logging.error(f"Received invalid message {message}")
+                if got_message:
+                    backoff = 0
+                else:
+                    time.sleep(0.1 * 2.0 ** backoff)
+                    if backoff < config.QUEUE_BACKOFF_LIMIT:
+                        print(f"No messages, backing off (n={backoff})")
+                        backoff += 1
+            except RetryError as e:
+                logging.error(f"Cancelled request due to maximum retry limit being reached -- check API server status: {e}")
 
     def handle_message(self, payload):
         logging.info(f"Received message {payload}")
@@ -219,25 +246,23 @@ class Worker():
             logging.info(f"Running instance {instance_id} with solver {payload['solver_id']}")
             # download the solver binary to a temporary directory
             # TODO cache this across multiple messages
-            fp_solver = get_solver_path_or_download(payload['solver_id'])
+            fp_solver = self.get_solver_path_or_download(payload['solver_id'])
             # download all instances
             with tempfile.NamedTemporaryFile(mode="w+", suffix=".smt2") as fp_instance:
                 logging.info(f"Downloading instance {instance_id}.")
-                r = requests.get(config.SMTLAB_API_ENDPOINT + "/instances/{}".format(instance_id), auth=(config.SMTLAB_USERNAME, config.SMTLAB_PASSWORD))
-                r.raise_for_status()
+                r = self.http.get(f"instances/{instance_id}")
                 fp_instance.write(r.json()['body'])
                 fp_instance.flush()
                 result = run_solver(fp_solver, instance_id, fp_instance.name, payload['arguments'])
                 result_action = {'action': 'process_results', 'run_id': payload['run_id'], 'results': [result]}
-                r = requests.post(config.SMTLAB_API_ENDPOINT + "/queues/scheduler", json=result_action, auth=(config.SMTLAB_USERNAME, config.SMTLAB_PASSWORD))
-                r.raise_for_status()
+                self.http.post("queues/scheduler", json=result_action)
         elif payload['action'] == "validate":
             # validate a result
             if "result_id" not in payload or "solver_id" not in payload:
                 logging.error("received 'validate' message with missing required fields")
                 return
             logging.info(f"Validating result {payload['result_id']} with solver {payload['solver_id']}")
-            fp_solver = get_solver_path_or_download(payload['solver_id'])
+            fp_solver = self.get_solver_path_or_download(payload['solver_id'])
             solver_arguments = None
             for solver in self.solvers:
                 if solver['id'] == payload['solver_id']:
@@ -245,8 +270,7 @@ class Worker():
                     break
             if solver_arguments is None:
                 # update cached solver data
-                r = requests.get(config.SMTLAB_API_ENDPOINT + "/solvers", auth=(config.SMTLAB_USERNAME, config.SMTLAB_PASSWORD))
-                r.raise_for_status()
+                r = self.http.get("solvers")
                 self.solvers = r.json()
                 solver_arguments = "[]"
                 for solver in self.solvers:
@@ -254,8 +278,7 @@ class Worker():
                         solver_arguments = solver['default_arguments']
                         break
             # fetch the result data...
-            r_result = requests.get(config.SMTLAB_API_ENDPOINT + "/results/{}".format(payload['result_id']), auth=(config.SMTLAB_USERNAME, config.SMTLAB_PASSWORD))
-            r_result.raise_for_status()
+            r_result = self.http.get(f"results/{payload['result_id']}")
             result_info = r_result.json()
 
             # we are only able to verfiy sat instances with a model 
@@ -269,14 +292,12 @@ class Worker():
             # ...and download the correct instance
             # TODO cache these as well
             with tempfile.NamedTemporaryFile(mode="w+", suffix=".smt2") as fp_instance:
-                r = requests.get(config.SMTLAB_API_ENDPOINT + "/instances/{}".format(result_info['instance_id']), auth=(config.SMTLAB_USERNAME, config.SMTLAB_PASSWORD))
-                r.raise_for_status()
+                r = self.http.get(f"instances/{result_info['instance_id']}")
                 fp_instance.write(r.json()['body'])
                 fp_instance.flush()
                 result = validate_result(fp_solver, solver_arguments, fp_instance.name, smt_model)
                 result_action = {'action': 'process_validation', 'result_id': payload['result_id'], 'solver_id': payload['solver_id'], 'validation': result['validation'], 'stdout': result['stdout']}
-                r = requests.post(config.SMTLAB_API_ENDPOINT + "/queues/scheduler", json=result_action, auth=(config.SMTLAB_USERNAME, config.SMTLAB_PASSWORD))
-                r.raise_for_status()
+                self.http.post("queues/scheduler", json=result_action)
         else:
             logging.error(f"received message with unknown 'action' {payload['action']}")
 
