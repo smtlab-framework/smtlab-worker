@@ -35,7 +35,7 @@ class TimeoutHTTPAdapter(HTTPAdapter):
 # {'instance_id': instance_id, 'result': string, "sat"/"unsat"/"timeout"/"unknown"/"error", 'stdout': string, runtime: integer, runtime *in milliseconds*}
 def run_solver(solver_binary_path, instance_id, instance_path, arguments, timeout=20):
     logging.info(f"Running {solver_binary_path} on instance {instance_path}: {arguments}, timeout={timeout}")
-    result_obj = {'instance_id': instance_id}
+    result_obj = {'instance_id': instance_id, 'node_name': config.SMTLAB_NODE_NAME}
     time = Timer ()
 
     timeout_ms = int(timeout * 1000.0)
@@ -171,7 +171,7 @@ class Worker():
         assert_status_hook = lambda response, *args, **kwargs: response.raise_for_status()
         self.http.hooks['response'] = [assert_status_hook]
         
-    def get_solver_path_or_download(solver_id):
+    def get_solver_path_or_download(self, solver_id):
         key = f"smtlab-solver-{solver_id}.bin"
         keypath = config.SMTLAB_SOLVER_DIR + "/" + key
         lockpath = keypath + ".lock"
