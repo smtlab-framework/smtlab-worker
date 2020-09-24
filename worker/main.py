@@ -10,10 +10,15 @@ import time
 import re
 import functools
 import filelock
+import itertools
+import sys
 from requests_toolbelt import sessions
 from requests.exceptions import RetryError
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
+from parser.SMTLIBv2Transform import *
+from parser.SMTLIBv2Parser import *
+from parser.SMTLIBv2Lexer import *
 
 import config
 
@@ -31,6 +36,26 @@ class TimeoutHTTPAdapter(HTTPAdapter):
             kwargs['timeout'] = self.timeout
         return super().send(request, **kwargs)
 
+#
+# Aux functions for instance handling
+def getSMTLibData(inputFile,stream=FileStream):
+    lexer = SMTLIBv2Lexer(stream(inputFile)) 
+    parser = SMTLIBv2Parser(CommonTokenStream(lexer))
+    return SMTLIBv2Transform().getListInstance(parser.start())
+
+def removeCommandsFromSMTLibData(smt_data,removables=[]):
+    return SMTLIBv2Transform().filterDeclarations(smt_data,removables)
+
+def smtLibDataToString(smt_data):
+    return SMTLIBv2Transform().flattenData(data)
+
+def getInitalInstance(inputFile):
+    return smtLibDataToString(removeCommandsFromSMTLibData(getSMTLibData(inputFile),["set-info","get-model"]))
+
+def getAssertedModelInstance(inputFile,model_str):
+    smt_data = removeCommandsFromSMTLibData(getSMTLibData(inputFile),["define-fun","declare-fun","declare-const","get-model","set-info"])
+    return smtLibDataToString(SMTLIBv2Transform().insertCommands(smt_data,getSMTLibData(model_str,InputStream),1))
+
 # This method should return a dictionary of the following form:
 # {'instance_id': instance_id, 'result': string, "sat"/"unsat"/"timeout"/"unknown"/"error", 'stdout': string, runtime: integer, runtime *in milliseconds*}
 def run_solver(solver_binary_path, instance_id, instance_path, arguments, timeout=20):
@@ -40,106 +65,62 @@ def run_solver(solver_binary_path, instance_id, instance_path, arguments, timeou
 
     timeout_ms = int(timeout * 1000.0)
     
-    try:
-        argument_array = json.loads(arguments)
-        out = subprocess.check_output ([solver_binary_path] + argument_array + [instance_path],timeout=timeout).decode('UTF-8').strip()
-    except subprocess.TimeoutExpired:
-        time.stop()
-        result_obj['result'] = "timeout"
-        result_obj['stdout'] = ""
-        result_obj['runtime'] = timeout_ms
-        logging.info(f"timeout, result is {result_obj}")
-        return result_obj
-    except subprocess.CalledProcessError as e:
-        time.stop()
-        result_obj['result'] = "error"
-        result_obj['stdout'] = f"stdout: {e.stdout} stderr: {e.stderr}"
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        smt_instance = os.path.join (tmpdirname, "instance.smt")
+        f=open(smt_instance,"w")
+        f.write(getInitalInstance(instance_path))
+        f.close()
+
+        try:
+            argument_array = json.loads(arguments)
+            out = subprocess.check_output ([solver_binary_path] + argument_array + [smt_instance],timeout=timeout).decode('UTF-8').strip()
+        except subprocess.TimeoutExpired:
+            time.stop()
+            result_obj['result'] = "timeout"
+            result_obj['stdout'] = ""
+            result_obj['runtime'] = timeout_ms
+            logging.info(f"timeout, result is {result_obj}")
+            return result_obj
+        except subprocess.CalledProcessError as e:
+            time.stop()
+            result_obj['result'] = "error"
+            result_obj['stdout'] = f"stdout: {e.stdout} stderr: {e.stderr}"
+            result_obj['runtime'] = time.getTime_ms()
+            logging.info(f"process exited with an error, result is {result_obj}")
+            return result_obj
+            
+        time.stop()    
+
+        result_obj['stdout'] = out
         result_obj['runtime'] = time.getTime_ms()
-        logging.info(f"process exited with an error, result is {result_obj}")
-        return result_obj
-        
-    time.stop()    
 
-    result_obj['stdout'] = out
-    result_obj['runtime'] = time.getTime_ms()
+        if "unsat" in out:
+            result_obj['result'] = "unsat"
+        elif "sat" in out:
+            result_obj['result'] = "sat"
+        elif time.getTime() >= timeout:
+            # sometimes python's subprocess does not terminate eagerly  
+            result_obj['result'] = "timeout"
+            result_obj['runtime'] = timeout_ms
+        elif "unknown" in out:
+            result_obj['result'] = "unknown"
+        else:
+            result_obj['result'] = "error"
+            
 
-    if "unsat" in out:
-        result_obj['result'] = "unsat"
-    elif "sat" in out:
-        result_obj['result'] = "sat"
-    elif time.getTime() >= timeout:
-        # sometimes python's subprocess does not terminate eagerly  
-        result_obj['result'] = "timeout"
-        result_obj['runtime'] = timeout_ms
-    elif "unknown" in out:
-        result_obj['result'] = "unknown"
-    else:
-        result_obj['result'] = "error"
-        
-
-    logging.info(f"result is {result_obj}")
+        logging.info(f"result is {result_obj}")
     return result_obj    
 
-#
-# Auxiliaries for the validation
-def _translate_smt26_escape_to_smt25(text):
-    return re.sub('u{(..)}', r'x\1', re.sub('u{(.)}', r'x0\1', text))  
-
-def _get_stripped_smt_commands(filepath,removables=["(define-fun","(declare-fun","(declare-const","(get-model"]):
-    s=open(filepath,"r")
-    # remove all comments
-    tmp_instance = ""
-    for l in s:
-        if not l.startswith(";"):
-            tmp_instance+=l
-
-    # identify matching positions
-    toret = dict()
-    pstack = []
-    for i, c in enumerate(tmp_instance):
-        if c == '(':
-            pstack.append(i)
-        elif c == ')':
-            if len(pstack) == 0:
-                raise IndexError("No matching closing parens at: " + str(i))
-            toret[pstack.pop()] = i
-    if len(pstack) > 0:
-        raise IndexError("No matching opening parens at: " + str(pstack.pop()))
-
-    # extract matching blocks
-    instance_list = []
-    logic = "(set-logic ALL)"
-    for (i,j) in toret.items():
-        covered = False
-        for (x,y) in [(n,m) for (n,m) in toret.items() if (n,m) != (i,j)]:
-            this_range = list(range(x,y+1))
-            if i in this_range and j in this_range:
-                covered = True
-                break
-        if not covered:
-            smt_cmd = tmp_instance[i:j+1]
-            if smt_cmd.startswith("(set-logic"):
-                logic=smt_cmd
-            elif functools.reduce(lambda a,b : a and b, [not smt_cmd.startswith(x) for x in removables]):
-                instance_list+=[tmp_instance[i:j+1]]
-    return [logic]+instance_list
-
-def validate_result(solver_binary_path, solver_arguments, instance_path, model, old_smt25_escape_translation=False):
+def validate_result(solver_binary_path, solver_arguments, instance_path, model):
     result_obj = {}
     result_obj['validation'] = "error"
     result_obj['stdout'] = ""
 
-    # translate \u{XX} escape sequences to the old ones (\xXX)
-    if old_smt25_escape_translation:
-        model=_translate_smt26_escape_to_smt25(model)
-
     # create new smt instance
-    new_smt_cmds = _get_stripped_smt_commands(instance_path)
     with tempfile.TemporaryDirectory() as tmpdirname:
-        validation_file = os.path.join (tmpdirname, "out.smt2")
+        validation_file = os.path.join (tmpdirname, "validation.smt")
         f=open(validation_file,"w")
-        for l in [new_smt_cmds[0]]+[model]+new_smt_cmds[1:]:
-            f.write(l+"\n")
+        f.write(getAssertedModelInstance(instance_path,model))
         f.close()
 
         # perform validation - pass a "fake" instance ID since we don't need it
