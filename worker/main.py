@@ -16,9 +16,9 @@ from requests_toolbelt import sessions
 from requests.exceptions import RetryError
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
-from parser.SMTLIBv2Transform import *
-from parser.SMTLIBv2Parser import *
-from parser.SMTLIBv2Lexer import *
+from worker.parser.SMTLIBv2Transform import *
+from worker.parser.SMTLIBv2Parser import *
+from worker.parser.SMTLIBv2Lexer import *
 
 import config
 
@@ -47,7 +47,7 @@ def removeCommandsFromSMTLibData(smt_data,removables=[]):
     return SMTLIBv2Transform().filterDeclarations(smt_data,removables)
 
 def smtLibDataToString(smt_data):
-    return SMTLIBv2Transform().flattenData(data)
+    return SMTLIBv2Transform().flattenData(smt_data)
 
 def getInitalInstance(inputFile):
     return smtLibDataToString(removeCommandsFromSMTLibData(getSMTLibData(inputFile),["set-info","get-model"]))
